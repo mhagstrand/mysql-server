@@ -585,10 +585,20 @@ char check_if_ignore_table(const char *table_name, char *table_type);
 static char *primary_key_fields(const char *table_name);
 static my_bool get_view_structure(char *table, char* db);
 static my_bool dump_all_views_in_db(char *database);
+
+
 static int dump_all_tablespaces();
 static int dump_tablespaces_for_tables(char *db, char **table_names, int tables);
 static int dump_tablespaces_for_databases(char** databases);
 static int dump_tablespaces(char* ts_where);
+
+static int dump_all_innodb_tablespaces();
+static int dump_innodb_tablespaces_for_tables(char *db, char **table_names, int tables);
+static int dump_innodb_tablespaces_for_databases(char** databases);
+static int dump_innodb_tablespaces(char* ts_where);
+
+
+
 static void print_comment(FILE *sql_file, my_bool is_error, const char *format,
                           ...);
 static const char* fix_identifier_with_newline(char*);
@@ -4155,6 +4165,11 @@ static int dump_all_tablespaces()
   return dump_tablespaces(NULL);
 }
 
+static int dump_all_innodb_tablespaces()
+{
+  return dump_innodb_tablespaces(NULL);
+}
+
 static int dump_tablespaces_for_tables(char *db, char **table_names, int tables)
 {
   DYNAMIC_STRING where;
@@ -4190,6 +4205,73 @@ static int dump_tablespaces_for_tables(char *db, char **table_names, int tables)
   return r;
 }
 
+static int dump_innodb_tablespaces_for_tables(char *db, char **table_names, int tables)
+{
+  DYNAMIC_STRING where;
+  int r;
+  int i;
+  char db_name_buff[NAME_LEN*2+3];
+  char name_buff[NAME_LEN*2+3];
+
+  mysql_real_escape_string_quote(mysql, db_name_buff, db, (ulong)strlen(db), '\'');
+
+  init_dynamic_string_checked(&where, " AND ist.SPACE IN ("
+                      "SELECT SPACE FROM"
+                      " INFORMATION_SCHEMA.INNODB_SYS_TABLES"
+                      " WHERE"
+                      " NAME='", 256, 1024);
+  dynstr_append_checked(&where, name_buff);
+
+  for (i=0 ; i<tables ; i++)
+  {
+    mysql_real_escape_string_quote(mysql, name_buff,
+                           table_names[i], (ulong)strlen(table_names[i]), '\'');
+
+    dynstr_append_checked(&where, "'");
+    dynstr_append_checked(&where, db_name_buff);
+    dynstr_append_checked(&where, "/");
+    dynstr_append_checked(&where, name_buff);
+    dynstr_append_checked(&where, "',");
+  }
+  dynstr_trunc(&where, 1);
+  dynstr_append_checked(&where,")");
+
+  DBUG_PRINT("info",("Dump InnoDB TS for Tables where: %s",where.str));
+  r= dump_tablespaces(where.str);
+  dynstr_free(&where);
+  return r;
+}
+
+static int dump_innodb_tablespaces_for_databases(char** databases)
+{
+  DYNAMIC_STRING where;
+  int r;
+  int i;
+  char db_name_buff[NAME_LEN*2+3];
+
+  init_dynamic_string_checked(&where, " AND ist.SPACE IN ("
+                      "SELECT SPACE FROM"
+                      " INFORMATION_SCHEMA.INNODB_SYS_TABLES"
+                      " WHERE"
+                      " NAME='", 256, 1024);
+
+  for (i=0 ; databases[i]!=NULL ; i++)
+  {
+    mysql_real_escape_string_quote(mysql, db_name_buff,
+                               databases[i], (ulong)strlen(databases[i]), '\'');
+    dynstr_append_checked(&where, "'");
+    dynstr_append_checked(&where, db_name_buff);
+    dynstr_append_checked(&where, "',");
+  }
+  dynstr_trunc(&where, 1);
+  dynstr_append_checked(&where,"))");
+
+  DBUG_PRINT("info",("Dump InnoDB TS for DBs where: %s",where.str));
+  r= dump_tablespaces(where.str);
+  dynstr_free(&where);
+  return r;
+}
+
 static int dump_tablespaces_for_databases(char** databases)
 {
   DYNAMIC_STRING where;
@@ -4218,6 +4300,72 @@ static int dump_tablespaces_for_databases(char** databases)
   r= dump_tablespaces(where.str);
   dynstr_free(&where);
   return r;
+}
+
+static int dump_innodb_tablespaces(char* ts_where)
+{
+  MYSQL_ROW row;
+  MYSQL_RES *tableres;
+  DYNAMIC_STRING sqlbuf;
+
+  DBUG_ENTER("dump_innodb_tablespaces");
+
+  init_dynamic_string_checked(&sqlbuf,
+                      "SELECT NAME,"
+                      " FILE_NAME,"
+                      " FS_BLOCK_SIZE,"
+                      " ENGINE"
+                      " FROM"
+                      " INFORMATION_SCHEMA.INNODB_SYS_TABLESPACES AS ist"
+                      " INNER JOIN INFORMATION_SCHEMA.FILES AS isf" 
+                      " ON isf.FILE_ID = ist.SPACE"
+                      " WHERE SPACE_TYPE='General'",
+                      256, 1024);
+  if(ts_where)
+  {
+    dynstr_append_checked(&sqlbuf, " ");
+    dynstr_append_checked(&sqlbuf, ts_where);
+  }
+
+  if (mysql_query(mysql, sqlbuf.str) ||
+      !(tableres = mysql_store_result(mysql)))
+  {
+    dynstr_free(&sqlbuf);
+    if (mysql_errno(mysql) == ER_BAD_TABLE_ERROR ||
+        mysql_errno(mysql) == ER_BAD_DB_ERROR ||
+        mysql_errno(mysql) == ER_UNKNOWN_TABLE)
+    {
+      fprintf(md_result_file,
+              "\n--\n-- Not dumping tablespaces as no FROM STUFF ADD ERROR HERE"
+              " table on this server\n--\n");
+      check_io(md_result_file);
+      DBUG_RETURN(0);
+    }
+
+    my_printf_error(0, "Error: '%s' when trying to dump tablespaces",
+                    MYF(0), mysql_error(mysql));
+    DBUG_RETURN(1);
+  }
+
+  while ((row= mysql_fetch_row(tableres)))
+  {
+    print_comment(md_result_file, 0, "\n--\n-- InnoDB General Tablespace: %s\n--\n", row[0]);
+    fprintf(md_result_file, "\nCREATE TABLESPACE %s\n", row[0]);
+
+    fprintf(md_result_file,
+            "  ADD DATAFILE '%s'\n"
+            "  FILE_BLOCK_SIZE %s\n"
+            "    ENGINE=%s;\n",
+            row[1],
+            row[2],
+            row[3]);
+
+    check_io(md_result_file);
+  }
+
+  mysql_free_result(tableres);
+  dynstr_free(&sqlbuf);
+  DBUG_RETURN(0);
 }
 
 static int dump_tablespaces(char* ts_where)
@@ -6129,12 +6277,18 @@ int main(int argc, char **argv)
     goto err;
 
   if (opt_alltspcs)
+  {
     dump_all_tablespaces();
+    dump_all_innodb_tablespaces();
+  }
 
   if (opt_alldbs)
   {
     if (!opt_alltspcs && !opt_notspcs)
+    {
       dump_all_tablespaces();
+      dump_all_innodb_tablespaces();
+    }
     dump_all_databases();
   }
   else
@@ -6157,14 +6311,20 @@ int main(int argc, char **argv)
     {
       /* Only one database and selected table(s) */
       if (!opt_alltspcs && !opt_notspcs)
+      {
         dump_tablespaces_for_tables(*argv, (argv + 1), (argc - 1));
+        dump_innodb_tablespaces_for_tables(*argv, (argv + 1), (argc - 1));
+      }
       dump_selected_tables(*argv, (argv + 1), (argc - 1));
     }
     else
     {
       /* One or more databases, all tables */
       if (!opt_alltspcs && !opt_notspcs)
+      {
         dump_tablespaces_for_databases(argv);
+        dump_innodb_tablespaces_for_databases(argv);
+      }
       dump_databases(argv);
     }
   }
